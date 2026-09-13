@@ -1,0 +1,8 @@
+# data hasil - berisi private key dan API key, jangan pernah di-push
+accounts.json
+hasil.txt
+*.har
+
+__pycache__/
+*.pyc
+*.tmp

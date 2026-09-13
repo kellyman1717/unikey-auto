@@ -1,0 +1,34 @@
+{
+  "base_url": "https://www.getunikey.ai",
+  "solver_url": "http://127.0.0.1:8000",
+
+  "turnstile_page_url": "https://www.getunikey.ai/sign-in",
+  "turnstile_timeout": 120,
+
+  "chain_id": 56,
+
+  "auto_create_api_key": true,
+  "token_name": "auto",
+  "unlimited_quota": true,
+
+  "proxy": null,
+
+  "min_pool": 12,
+  "refill_below": 4,
+  "refill_rounds": 4,
+  "refill_backoff": 3,
+  "validate_batch": 260,
+  "validate_workers": 48,
+  "validate_timeout": 8.0,
+  "source_min_interval": 60,
+  "proxy_attempts": 5,
+  "recent_avoid": 5,
+
+  "accounts_file": "accounts.json",
+  "hasil_file": "hasil.txt",
+
+  "request_timeout": 25,
+  "max_retries": 3,
+  "retry_base_delay": 5,
+  "delay_between_accounts": 3
+}
