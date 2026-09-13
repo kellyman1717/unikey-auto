@@ -83,13 +83,60 @@ Semua pengaturan ada di `config.json`.
 
 ## Sumber proxy
 
-Daftar sumber dan hasil ukurnya ada di `PROXY_SOURCES` dalam `unikey_bot.py`.
+Daftar sumber dan hasil ukurnya ada di `PROXY_SOURCES` dalam `proxypool.py`.
 Yang paling produktif: monosans, roosterkid (SOCKS), dan proxifly. Sumber yang
 sudah mati tidak dipakai.
 
 Proxy gratis punya tingkat keberhasilan sekitar 10% dan cepat mati, jadi bot
 selalu memvalidasi sebelum memakai dan otomatis membuang yang gagal. Untuk
 pemakaian dalam jumlah besar, proxy berbayar jauh lebih stabil.
+
+## proxypool.py
+
+Logika proxy dipisah ke `proxypool.py` supaya bisa dipakai skrip lain, bukan
+cuma bot ini. Modulnya berdiri sendiri: tidak mengimpor apa pun dari
+`unikey_bot.py`, dan target validasinya bisa diarahkan ke situs mana saja.
+
+Isi modulnya:
+
+| Bagian | Kegunaan |
+| --- | --- |
+| `ProxyPool` | Pool proxy yang selalu terisi. `take()` selalu memberi proxy valid, atau melempar `ProxyUnavailable` |
+| `attempt_with_rotation` | Jalankan tugas dengan rotasi proxy otomatis saat gagal |
+| `proxies_for` | Dict proxies untuk `requests` (dua key sekaligus) |
+| `proxied_session` | Session `requests` yang tidak bisa dibelokkan proxy dari luar |
+| `ProxyFailure` / `RateLimited` | Pembeda error: salah proxy, atau target yang membatasi |
+| `PROXY_SOURCES` | Daftar sumber proxy gratis |
+| `normalize_proxy` | Ubah baris sumber jadi `scheme://ip:port` |
+
+Contoh pakai di skrip lain:
+
+```python
+import requests
+from proxypool import ProxyPool, attempt_with_rotation
+
+pool = ProxyPool(target="https://situsku.com/api/ping")
+pool.warm()
+
+def kerja(proxy):
+    return requests.get("https://situsku.com/data",
+                        proxies=pool.proxies_for(proxy), timeout=20).json()
+
+data, proxy_dipakai = attempt_with_rotation(pool, kerja)
+```
+
+Kalau target butuh pengecekan isi response, beri `validator`:
+
+```python
+def cek(resp):
+    return resp.status_code == 200 and resp.json().get("ok") is True
+
+pool = ProxyPool(target="https://situsku.com/api/status", validator=cek)
+```
+
+Tingkat keberhasilan proxy gratis berbeda-beda per situs, jadi `target` sebaiknya
+diarahkan ke endpoint ringan milik situs tujuan sendiri. Proxy yang lolos
+validasi di satu situs belum tentu bisa dipakai di situs lain.
 
 ## Catatan soal kredit
 
@@ -103,7 +150,9 @@ berbeda skala penyajian.
 
 ```
 unikey_bot.py    skrip utama
+proxypool.py     modul pool proxy, bisa dipakai skrip lain
 config.json      pengaturan
-accounts.json    hasil lengkap
+accounts.json    hasil lengkap (berisi private key, tidak di-push)
 hasil.txt        ringkasan hasil
+apikey.txt       daftar API key saja
 ```

@@ -1,6 +1,7 @@
 # data hasil - berisi private key dan API key, jangan pernah di-push
 accounts.json
 hasil.txt
+apikey.txt
 *.har
 
 __pycache__/

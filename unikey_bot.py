@@ -50,52 +50,11 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
 
-# Sources ranked by measured yield against https://www.getunikey.ai (probe run 2026-09-13).
-#   monosans/all.txt  8/30  (27%)  <- best, scheme already prefixed, includes socks
-#   roosterkid SOCKS5 3/8   (37%)  <- small list, fresh (hourly commits)
-#   roosterkid SOCKS4 3/15  (20%)
-#   proxifly http+socks5 4/30 (13%, but flaky - 3 of 4 died on immediate retest)
-#   proxyscrape v4     3/30  (10%) <- real API, rate limits -> longest cooldown
-#   speedx http        1/90  (1%)  <- filler only
-#   shiftytr           0/71  (0%)  <- REMOVED: repo last committed 2023-08-11, all dead
-PROXY_SOURCES: list[dict] = [
-    {"name": "monosans", "scheme": None, "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt"},
-    {"name": "roosterkid-socks5", "scheme": "socks5", "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5.txt"},
-    {"name": "roosterkid-socks4", "scheme": "socks4", "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4.txt"},
-    {"name": "proxifly-http", "scheme": "http", "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"},
-    {"name": "proxifly-socks5", "scheme": "socks5", "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"},
-    {"name": "proxyscrape-v4", "scheme": None, "cooldown": 120,
-     "url": "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
-            "&protocol=all&proxy_format=protocolipport&format=text&timeout=20000"},
-    {"name": "speedx-http", "scheme": "http", "cooldown": 60,
-     "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"},
-]
-
-# A bare "IP:PORT" line, possibly surrounded by junk (roosterkid lines look like
-# "🇮🇩 203.174.15.138:8080 65ms ID [PT Orion Cyber Internet]"), so this is a
-# SEARCH, not a line-anchored match.
-IPPORT_RE = re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s*:\s*(\d{2,5})")
-
-# headers on scrape requests, otherwise public APIs 403 the default python-requests UA
-SCRAPE_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# how long a proxy stays banned, by why it died (seconds)
-BAN_TTL = {
-    "proxy_error": 900,    # tunnel refused / connect timeout -> genuinely dead
-    "ssl_error": 900,
-    "timeout": 300,        # read timeout -> may be transient target load
-    "http_status": 1800,   # 403/429/captive portal -> shared IP already flagged
-    "failed_use": 900,     # worked in validation, died during real use
-}
+# Logika proxy ada di modul terpisah supaya bisa dipakai skrip lain.
+from proxypool import (                                    # noqa: E402
+    ProxyPool, ProxyUnavailable, ProxyFailure, RateLimited,
+    attempt_with_rotation, classify_failure,
+)
 
 
 _SOLVER_SESSION: requests.Session | None = None
@@ -115,22 +74,6 @@ def solver_session() -> requests.Session:
     return _SOLVER_SESSION
 
 
-class ProxyUnavailable(RuntimeError):
-    """Raised when no validated proxy can be obtained. Never falls back to direct."""
-
-
-class ProxyFailure(RuntimeError):
-    """A request died because of the proxy (not the target). Triggers rotation."""
-
-    def __init__(self, message: str, reason: str = "proxy_error"):
-        super().__init__(message)
-        self.reason = reason
-
-
-class RateLimited(RuntimeError):
-    """The target kept answering 429/5xx. The proxy may be fine - don't ban it."""
-
-
 def log(msg: str) -> None:
     print(f"[{datetime.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
@@ -139,335 +82,6 @@ def load_config() -> dict:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
-# --------------------------------------------------------------------------
-#  PROXY
-# --------------------------------------------------------------------------
-def normalize_proxy(raw: str, default_scheme: str | None = None) -> str | None:
-    """Turn any source line into a scheme://ip:port string.
-
-    Handles all three observed formats:
-      - 'http://1.2.3.4:8080'          (monosans all.txt, proxifly, proxyscrape)
-      - '1.2.3.4:8080'                (speedx, shiftytr)
-      - '🇮🇩 1.2.3.4:8080 65ms ID [ISP]'  (roosterkid - decorated, needs a SEARCH)
-    The scheme must come from the SOURCE, never be guessed: a socks port
-    mislabeled http:// fails in confusing ways much later.
-    """
-    line = raw.strip()
-    if not line or line.startswith("#"):
-        return None
-
-    m = IPPORT_RE.search(line)
-    if not m:
-        return None
-    ip, port = m.group(1), m.group(2)
-    # reject obviously bogus octets / ports
-    if not (1 <= int(port) <= 65535):
-        return None
-    if any(int(o) > 255 for o in ip.split(".")):
-        return None
-
-    explicit = re.match(r"^(https?|socks4a?|socks5h?)://", line, re.I)
-    if explicit:
-        scheme = explicit.group(1).lower()
-    else:
-        scheme = default_scheme or "http"
-
-    # socks5h forces DNS resolution at the proxy (remote DNS). Without it urllib3
-    # resolves locally, which both leaks the hostname and can fail where a
-    # remote-resolving handshake would succeed.
-    if scheme == "socks5":
-        scheme = "socks5h"
-    return f"{scheme}://{ip}:{port}"
-
-
-def fetch_source(src: dict, timeout: float = 15.0) -> list[str]:
-    """Fetch and parse one proxy source. Returns [] on any failure."""
-    try:
-        r = requests.get(src["url"], headers=SCRAPE_HEADERS, timeout=timeout)
-        if r.status_code != 200:
-            log(f"  source {src['name']}: HTTP {r.status_code}")
-            return []
-        r.encoding = "utf-8"  # roosterkid SOCKS4.txt is mis-encoded; never let it guess
-        out = []
-        for line in r.text.splitlines():
-            p = normalize_proxy(line, src["scheme"])
-            if p:
-                out.append(p)
-        return out
-    except Exception as e:
-        log(f"  source {src['name']}: {type(e).__name__}")
-        return []
-
-
-def scrape_proxies(sources: list[dict] | None = None,
-                   cache=None) -> list[str]:
-    """Pull raw candidates from every source that isn't in cooldown."""
-    sources = sources or PROXY_SOURCES
-    now = time.monotonic()
-    out: list[str] = []
-
-    for src in sources:
-        if cache is not None and now < cache.source_cooldown_until(src["name"]):
-            continue
-        got = fetch_source(src)
-        if cache is not None:
-            cache.mark_source_fetched(src["name"], src["cooldown"], ok=bool(got))
-        log(f"  source {src['name']}: {len(got)} proxies")
-        out.extend(got)
-
-    seen, uniq = set(), []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
-
-
-def _classify_failure(exc: BaseException) -> str:
-    name = type(exc).__name__
-    if "SSLError" in name:
-        return "ssl_error"
-    if "ProxyError" in name or "ConnectTimeout" in name or "ConnectionError" in name:
-        return "proxy_error"
-    return "timeout"
-
-
-def check_proxy(proxy: str, target: str, timeout: tuple[float, float]) -> tuple[bool, float, str]:
-    """Validate one proxy. Returns (ok, latency_seconds, ban_reason).
-
-    Strict: only a real 200 with a plausible body counts. A proxy answering
-    403/429/captive-portal is NOT usable - it would burn the whole retry
-    budget on 429s before being rotated.
-    """
-    t0 = time.perf_counter()
-    try:
-        r = requests.get(
-            target,
-            # BOTH keys must be set: an https:// target with only 'http' set
-            # bypasses the proxy entirely.
-            proxies={"http": proxy, "https": proxy},
-            timeout=timeout,
-            headers={"User-Agent": UA, "Accept": "application/json, text/plain, */*"},
-            params={"_": random.random()},
-        )
-        if r.status_code != 200:
-            return False, time.perf_counter() - t0, "http_status"
-        # body sanity: /api/status returns JSON with a "success" key
-        try:
-            if r.json().get("success") is not True:
-                return False, time.perf_counter() - t0, "http_status"
-        except ValueError:
-            return False, time.perf_counter() - t0, "http_status"
-        return True, time.perf_counter() - t0, ""
-    except Exception as e:
-        return False, time.perf_counter() - t0, _classify_failure(e)
-
-
-class ProxyCache:
-    """Per-process bans and source cooldowns so we stop re-testing dead proxies."""
-
-    def __init__(self):
-        self.banned: dict[str, float] = {}          # proxy -> monotonic expiry
-        self.source_until: dict[str, float] = {}    # source name -> monotonic expiry
-        self.lock = threading.Lock()
-
-    def is_banned(self, proxy: str) -> bool:
-        with self.lock:
-            return time.monotonic() < self.banned.get(proxy, 0.0)
-
-    def ban(self, proxy: str, reason: str = "proxy_error") -> None:
-        ttl = BAN_TTL.get(reason, 900)
-        with self.lock:
-            self.banned[proxy] = time.monotonic() + ttl
-
-    def source_cooldown_until(self, name: str) -> float:
-        with self.lock:
-            return self.source_until.get(name, 0.0)
-
-    def mark_source_fetched(self, name: str, cooldown: float, ok: bool = True) -> None:
-        # failed fetches back off harder so a 429'ing API isn't hammered
-        with self.lock:
-            self.source_until[name] = time.monotonic() + (cooldown if ok else cooldown * 3)
-
-
-class ProxyPool:
-    """Always-on proxy pool.
-
-    Guarantees: take() either returns a validated proxy or raises
-    ProxyUnavailable. It never returns None, so no caller can accidentally
-    run direct.
-    """
-
-    def __init__(self, cfg: dict, cache: ProxyCache | None = None):
-        self.cfg = cfg
-        self.fixed = cfg.get("proxy")
-        self.cache = cache or ProxyCache()
-        self.target = cfg["base_url"].rstrip("/") + "/api/status"
-        self.want = int(cfg.get("min_pool", 12))
-        self.min_pool = int(cfg.get("refill_below", 4))
-        self.workers = int(cfg.get("validate_workers", 48))
-        self.validate_timeout = float(cfg.get("validate_timeout", 8.0))
-        self.pool: list[tuple[str, float]] = []     # (proxy, latency) sorted fastest-first
-        self.in_use: set[str] = set()
-        self.recent: list[str] = []                 # recently handed out, avoid reusing
-        self.lock = threading.Lock()
-        self.last_warm = 0.0
-        self.warm_interval = float(cfg.get("source_min_interval", 60))
-
-    # -- internal ----------------------------------------------------------
-    def _timeout_for(self, proxy: str) -> tuple[float, float]:
-        # socks handshakes are slower than a plain HTTP CONNECT
-        connect = 8.0 if proxy.startswith("socks") else 5.0
-        return (connect, self.validate_timeout)
-
-    def _refill(self, blocking: bool) -> None:
-        """Scrape + validate until the pool holds `want` proxies (or we give up)."""
-        with self.lock:
-            if time.monotonic() - self.last_warm < self.warm_interval and self.pool:
-                return
-            self.last_warm = time.monotonic()
-
-        rounds = int(self.cfg.get("refill_rounds", 4))
-        for rnd in range(1, rounds + 1):
-            with self.lock:
-                have = len(self.pool)
-            need = self.want - have
-            if need <= 0:
-                return
-
-            raw = scrape_proxies(cache=self.cache)
-            if not raw:
-                log(f"  refill round {rnd}: no candidates fetched")
-            else:
-                # spread-sample, never the head (head-of-list is always stale)
-                with self.lock:
-                    known = {p for p, _ in self.pool}
-                cands = [p for p in raw
-                         if p not in known and not self.cache.is_banned(p)]
-                random.shuffle(cands)
-                cands = cands[:int(self.cfg.get("validate_batch", 260))]
-                log(f"  refill round {rnd}: validating {len(cands)} candidates "
-                    f"(have {have}/{self.want})")
-
-                found = self._validate_batch(cands, need)
-                with self.lock:
-                    for p, lat in found:
-                        if p not in known:
-                            self.pool.append((p, lat))
-                            known.add(p)
-                    self.pool.sort(key=lambda t: t[1])
-                    have = len(self.pool)
-                log(f"  refill round {rnd}: +{len(found)} -> pool {have}")
-
-            if have >= self.want:
-                return
-            if rnd < rounds:
-                time.sleep(float(self.cfg.get("refill_backoff", 3)))
-
-        with self.lock:
-            have = len(self.pool)
-        if have == 0:
-            raise ProxyUnavailable(
-                f"could not obtain any working proxy after {rounds} refill rounds")
-        log(f"  WARNING: pool only reached {have}/{self.want}")
-
-    def _validate_batch(self, cands: list[str], want: int) -> list[tuple[str, float]]:
-        """Validate concurrently with early exit once `want` good ones are found."""
-        if not cands:
-            return []
-        good: list[tuple[str, float]] = []
-        ex = ThreadPoolExecutor(max_workers=min(self.workers, len(cands)))
-        try:
-            futs = {ex.submit(check_proxy, p, self.target,
-                              self._timeout_for(p)): p for p in cands}
-            for fut in as_completed(futs):
-                p = futs[fut]
-                try:
-                    ok, lat, reason = fut.result()
-                except Exception as e:
-                    ok, lat, reason = False, 0.0, _classify_failure(e)
-                if ok:
-                    good.append((p, lat))
-                    if len(good) >= want:
-                        break
-                else:
-                    self.cache.ban(p, reason)
-            # stop the stragglers - this is what turns a 60s refill into ~5s
-            ex.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            ex.shutdown(wait=False, cancel_futures=True)
-        return good
-
-    # -- public ------------------------------------------------------------
-    def warm(self, blocking: bool = True) -> None:
-        """Fill the pool before the first account. Raises if it can't."""
-        if self.fixed:
-            log(f"using fixed proxy: {self.fixed}")
-            return
-        log("warming proxy pool ...")
-        self._refill(blocking=blocking)
-        with self.lock:
-            log(f"proxy pool ready: {len(self.pool)} live proxies")
-
-    def take(self) -> str:
-        """Return a validated proxy, or raise ProxyUnavailable. Never None."""
-        if self.fixed:
-            return self.fixed
-
-        # top up before we get to zero, not after
-        if len(self._snapshot()) < self.min_pool:
-            self._refill(blocking=True)
-
-        with self.lock:
-            # prefer the fastest quartile, skipping anything currently in use
-            avail = [(p, l) for p, l in self.pool if p not in self.in_use]
-            if not avail:
-                avail = list(self.pool)
-            if not avail:
-                raise ProxyUnavailable("pool empty after refill")
-            top = avail[:max(1, len(avail) // 4)]
-
-            # avoid handing the same IP to consecutive accounts - reusing one
-            # too soon is what trips per-IP rate limits
-            fresh = [(p, l) for p, l in top if p not in self.recent]
-            pick_from = fresh or top
-
-            proxy, _ = random.choice(pick_from)
-            self.in_use.add(proxy)
-            self.recent.append(proxy)
-            keep = max(1, min(len(self.pool) - 1, int(self.cfg.get("recent_avoid", 5))))
-            while len(self.recent) > keep:
-                self.recent.pop(0)
-            return proxy
-
-    def _snapshot(self) -> list[str]:
-        with self.lock:
-            return [p for p, _ in self.pool]
-
-    def release(self, proxy: str | None) -> None:
-        """Mark a proxy idle again. Safe to call with None or an unknown proxy."""
-        if not proxy:
-            return
-        with self.lock:
-            self.in_use.discard(proxy)
-
-    def drop(self, proxy: str | None, reason: str = "failed_use") -> None:
-        """Remove a proxy from the pool and ban it. Always logs."""
-        if not proxy:
-            return
-        with self.lock:
-            before = len(self.pool)
-            self.pool = [(p, l) for p, l in self.pool if p != proxy]
-            self.in_use.discard(proxy)
-            after = len(self.pool)
-        self.cache.ban(proxy, reason)
-        if before != after or reason == "failed_use":
-            log(f"dropped proxy {proxy} ({reason}) -> {after} left")
-
-    def stats(self) -> str:
-        with self.lock:
-            return f"{len(self.pool)} live / {len(self.in_use)} in use"
 
 
 # --------------------------------------------------------------------------
@@ -526,8 +140,8 @@ class UnikeyClient:
             except requests.RequestException as e:
                 # distinguish a dead proxy from server trouble: only a proxy
                 # fault should trigger rotation upstream
-                reason = _classify_failure(e)
-                raise ProxyFailure(f"{type(e).__name__}: {e}", reason) from e
+                raise ProxyFailure(f"{type(e).__name__}: {e}",
+                                   classify_failure(e)) from e
 
             if r.status_code == 429 or (r.status_code >= 500 and retry_on_rate_limit):
                 last = f"HTTP {r.status_code}"
@@ -795,63 +409,47 @@ def run_create_flow(cfg: dict, client: UnikeyClient, acct, record: dict) -> None
     record["status"] = "ok"
 
 
-def attempt_with_rotation(cfg: dict, pool: ProxyPool, work) -> tuple[Any, str]:
-    """Run `work(client)` rotating proxies on failure.
+def run_with_rotation(cfg: dict, pool: ProxyPool, work) -> tuple[Any, str]:
+    """Jalankan `work(client)` dengan rotasi proxy.
 
-    `work` raises ProxyFailure  -> ban that proxy, try another (it's the proxy's fault)
-             raises RateLimited -> the proxy is fine, the target is throttling;
-                                   keep the proxy but still try a fresh IP
-             anything else      -> a real error in our own code. Retry on a fresh
-                                   proxy (the failure may be data-dependent), but
-                                   NEVER blame the proxy for it.
-
-    Returns (result, proxy_used). Raises ProxyUnavailable if we run out.
+    Pembungkus tipis di atas proxypool.attempt_with_rotation: modul itu bekerja
+    dengan string proxy, sedangkan bot ini butuh UnikeyClient yang sudah terpasang
+    proxy. Parameter waktunya diambil dari config.
     """
-    attempts = int(cfg.get("proxy_attempts", 5))
-    last_exc: BaseException | None = None
+    return attempt_with_rotation(
+        pool,
+        lambda proxy: work(UnikeyClient(cfg, proxy)),
+        attempts=int(cfg.get("proxy_attempts", 5)),
+        retry_delay=float(cfg.get("retry_base_delay", 5)),
+        logger=log,
+    )
 
-    for attempt in range(1, attempts + 1):
-        proxy = None
-        try:
-            proxy = pool.take()
-            log(f"using proxy: {proxy}  [{pool.stats()}]")
-            result = work(UnikeyClient(cfg, proxy))
-            pool.release(proxy)
-            return result, proxy
-        except ProxyFailure as e:
-            # the proxy itself is broken -> ban it and rotate
-            log(f"  ! proxy failed ({e.reason}): {str(e)[:120]}")
-            pool.drop(proxy, e.reason)
-            last_exc = e
-        except RateLimited as e:
-            # target-side throttle, not the proxy's fault: keep the proxy in the
-            # pool, just come back on a different IP
-            log(f"  ! rate limited: {str(e)[:120]}")
-            pool.release(proxy)
-            last_exc = e
-        except ProxyUnavailable:
-            raise
-        except Exception as e:
-            # A bug or a bad response shape is NOT the proxy's fault. Dropping
-            # the proxy here would burn the whole pool on one code error.
-            log(f"  ! error: {type(e).__name__}: {str(e)[:160]}")
-            pool.release(proxy)
-            last_exc = e
-        finally:
-            # never let in_use leak, whatever happened above
-            if proxy:
-                pool.release(proxy)
 
-        if attempt < attempts:
-            time.sleep(float(cfg.get("retry_base_delay", 5)))
+def make_pool(cfg: dict) -> ProxyPool:
+    """Bangun ProxyPool dari config.json.
 
-    raise ProxyUnavailable(
-        f"gave up after {attempts} proxy attempts (last: {last_exc})")
+    Target validasinya /api/status milik UNIKEY sendiri, supaya proxy yang lolos
+    benar-benar bisa menjangkau server tujuan.
+    """
+    return ProxyPool(
+        target=cfg["base_url"].rstrip("/") + "/api/status",
+        fixed=cfg.get("proxy"),
+        want=int(cfg.get("min_pool", 12)),
+        min_pool=int(cfg.get("refill_below", 4)),
+        refill_rounds=int(cfg.get("refill_rounds", 4)),
+        refill_backoff=float(cfg.get("refill_backoff", 3)),
+        validate_batch=int(cfg.get("validate_batch", 260)),
+        validate_workers=int(cfg.get("validate_workers", 48)),
+        validate_timeout=float(cfg.get("validate_timeout", 8.0)),
+        source_min_interval=float(cfg.get("source_min_interval", 60)),
+        recent_avoid=int(cfg.get("recent_avoid", 5)),
+        logger=log,
+    )
 
 
 def cmd_create(cfg: dict, count: int) -> None:
     acct_path = os.path.join(BASE_DIR, cfg["accounts_file"])
-    pool = ProxyPool(cfg)
+    pool = make_pool(cfg)
     pool.warm()   # raises ProxyUnavailable if it can't get any proxy
 
     for i in range(1, count + 1):
@@ -866,7 +464,7 @@ def cmd_create(cfg: dict, count: int) -> None:
         log(f"wallet created: {acct.address}")
 
         try:
-            _, proxy = attempt_with_rotation(
+            _, proxy = run_with_rotation(
                 cfg, pool, lambda client: run_create_flow(cfg, client, acct, record))
             record["proxy"] = proxy
         except Exception as e:
@@ -891,7 +489,7 @@ def cmd_refresh(cfg: dict) -> None:
         log("no saved accounts")
         return
 
-    pool = ProxyPool(cfg)
+    pool = make_pool(cfg)
     pool.warm()
     changed = False
 
@@ -915,7 +513,7 @@ def cmd_refresh(cfg: dict) -> None:
             return out
 
         try:
-            res, proxy = attempt_with_rotation(cfg, pool, work)
+            res, proxy = run_with_rotation(cfg, pool, work)
             info = res["info"]
             a["user_id"] = info["id"]
             a["username"] = info.get("username", a.get("username"))
@@ -945,7 +543,7 @@ def cmd_refresh(cfg: dict) -> None:
 
 def cmd_proxy(cfg: dict, count: int) -> None:
     """Fetch + validate proxies and print them, without creating any account."""
-    pool = ProxyPool(cfg)
+    pool = make_pool(cfg)
     pool.warm()
     with pool.lock:
         rows = list(pool.pool)
