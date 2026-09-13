@@ -801,7 +801,9 @@ def attempt_with_rotation(cfg: dict, pool: ProxyPool, work) -> tuple[Any, str]:
     `work` raises ProxyFailure  -> ban that proxy, try another (it's the proxy's fault)
              raises RateLimited -> the proxy is fine, the target is throttling;
                                    keep the proxy but still try a fresh IP
-             anything else      -> real error, abort immediately
+             anything else      -> a real error in our own code. Retry on a fresh
+                                   proxy (the failure may be data-dependent), but
+                                   NEVER blame the proxy for it.
 
     Returns (result, proxy_used). Raises ProxyUnavailable if we run out.
     """
@@ -830,8 +832,10 @@ def attempt_with_rotation(cfg: dict, pool: ProxyPool, work) -> tuple[Any, str]:
         except ProxyUnavailable:
             raise
         except Exception as e:
+            # A bug or a bad response shape is NOT the proxy's fault. Dropping
+            # the proxy here would burn the whole pool on one code error.
             log(f"  ! error: {type(e).__name__}: {str(e)[:160]}")
-            pool.drop(proxy, "failed_use")
+            pool.release(proxy)
             last_exc = e
         finally:
             # never let in_use leak, whatever happened above
